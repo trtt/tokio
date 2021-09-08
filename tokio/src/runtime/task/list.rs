@@ -36,6 +36,15 @@ cfg_has_atomic_u64! {
             }
         }
     }
+
+    fn get_next_n_ids(n: u32) -> u64 {
+        loop {
+            let id = NEXT_OWNED_TASKS_ID.fetch_add(u64::from(n), Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
 }
 
 cfg_not_has_atomic_u64! {
@@ -51,11 +60,26 @@ cfg_not_has_atomic_u64! {
             }
         }
     }
+
+    fn get_next_n_ids(n: u32) -> u64 {
+        loop {
+            let id = NEXT_OWNED_TASKS_ID.fetch_add(n, Ordering::Relaxed);
+            if id != 0 {
+                return u64::from(id);
+            }
+        }
+    }
 }
 
+const OWNED_NUM: u32 = 4;
+
+#[repr(align(128))]
+struct CachePadded<T>(T);
+
 pub(crate) struct OwnedTasks<S: 'static> {
-    inner: Mutex<OwnedTasksInner<S>>,
-    id: u64,
+    inners: Vec<CachePadded<Mutex<OwnedTasksInner<S>>>>,
+    start_id: u64,
+    current_idx: AtomicU64,
 }
 pub(crate) struct LocalOwnedTasks<S: 'static> {
     inner: UnsafeCell<OwnedTasksInner<S>>,
@@ -69,14 +93,34 @@ struct OwnedTasksInner<S: 'static> {
 
 impl<S: 'static> OwnedTasks<S> {
     pub(crate) fn new() -> Self {
+        let inners = (0..OWNED_NUM)
+            .map(|_| {
+                CachePadded(Mutex::new(OwnedTasksInner {
+                    list: LinkedList::new(),
+                    closed: false,
+                }))
+            })
+            .collect();
         Self {
-            inner: Mutex::new(OwnedTasksInner {
-                list: LinkedList::new(),
-                closed: false,
-            }),
-            id: get_next_id(),
+            inners,
+            start_id: get_next_n_ids(OWNED_NUM),
+            current_idx: AtomicU64::new(0),
         }
     }
+
+    // pub(crate) fn new_n(n: u32) -> (Vec<Self>, u64) {
+    //     let id = get_next_n_ids(n);
+    //     let vec = (0..n as u64)
+    //         .map(|i| Self {
+    //             inner: Mutex::new(OwnedTasksInner {
+    //                 list: LinkedList::new(),
+    //                 closed: false,
+    //             }),
+    //             id: id + i,
+    //         })
+    //         .collect();
+    //     (vec, id)
+    // }
 
     /// Bind the provided task to this OwnedTasks instance. This fails if the
     /// OwnedTasks has been closed.
@@ -92,13 +136,16 @@ impl<S: 'static> OwnedTasks<S> {
     {
         let (task, notified, join) = super::new_task(task, scheduler);
 
+        let idx = self.current_idx.fetch_add(1, Ordering::Relaxed) % u64::from(OWNED_NUM);
+        let id = self.start_id + idx;
         unsafe {
             // safety: We just created the task, so we have exclusive access
             // to the field.
-            task.header().set_owner_id(self.id);
+            task.header().set_owner_id(id);
         }
 
-        let mut lock = self.inner.lock();
+        let inner = &self.inners[idx as usize].0;
+        let mut lock = inner.lock();
         if lock.closed {
             drop(lock);
             drop(notified);
@@ -114,7 +161,8 @@ impl<S: 'static> OwnedTasks<S> {
     /// a LocalNotified, giving the thread permission to poll this task.
     #[inline]
     pub(crate) fn assert_owner(&self, task: Notified<S>) -> LocalNotified<S> {
-        assert_eq!(task.header().get_owner_id(), self.id);
+        let task_id = task.header().get_owner_id();
+        assert!(self.start_id <= task_id && task_id < self.start_id + u64::from(OWNED_NUM));
 
         // safety: All tasks bound to this OwnedTasks are Send, so it is safe
         // to poll it on this thread no matter what thread we are on.
@@ -130,25 +178,28 @@ impl<S: 'static> OwnedTasks<S> {
     where
         S: Schedule,
     {
-        // The first iteration of the loop was unrolled so it can set the
-        // closed bool.
-        let first_task = {
-            let mut lock = self.inner.lock();
-            lock.closed = true;
-            lock.list.pop_back()
-        };
-        match first_task {
-            Some(task) => task.shutdown(),
-            None => return,
-        }
-
-        loop {
-            let task = match self.inner.lock().list.pop_back() {
-                Some(task) => task,
-                None => return,
+        for inner in &self.inners {
+            let inner = &inner.0;
+            // The first iteration of the loop was unrolled so it can set the
+            // closed bool.
+            let first_task = {
+                let mut lock = inner.lock();
+                lock.closed = true;
+                lock.list.pop_back()
             };
+            match first_task {
+                Some(task) => task.shutdown(),
+                None => return,
+            }
 
-            task.shutdown();
+            loop {
+                let task = match inner.lock().list.pop_back() {
+                    Some(task) => task,
+                    None => return,
+                };
+
+                task.shutdown();
+            }
         }
     }
 
@@ -159,15 +210,22 @@ impl<S: 'static> OwnedTasks<S> {
             return None;
         }
 
-        assert_eq!(task_id, self.id);
+        assert!(self.start_id <= task_id && task_id < self.start_id + OWNED_NUM as u64);
 
+        let inner = &self.inners[(task_id - self.start_id) as usize].0;
         // safety: We just checked that the provided task is not in some other
         // linked list.
-        unsafe { self.inner.lock().list.remove(task.header().into()) }
+        unsafe { inner.lock().list.remove(task.header().into()) }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.inner.lock().list.is_empty()
+        for inner in &self.inners {
+            let inner = &inner.0;
+            if !inner.lock().list.is_empty() {
+                return false;
+            }
+        }
+        true
     }
 }
 
