@@ -43,7 +43,7 @@ unsafe impl<T> Send for Inner<T> {}
 unsafe impl<T> Sync for Inner<T> {}
 
 #[cfg(not(loom))]
-const LOCAL_QUEUE_CAPACITY: usize = 256;
+const LOCAL_QUEUE_CAPACITY: usize = 1 << 15;
 
 // Shrink the size of the local queue when using loom. This shouldn't impact
 // logic, but allows loom to test more edge cases in a reasonable a mount of
